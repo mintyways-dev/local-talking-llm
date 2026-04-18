@@ -170,3 +170,4 @@ prompt.txt
 sample.wav
 *.sh
 .venv
+.voice_assistant_calibration.json
