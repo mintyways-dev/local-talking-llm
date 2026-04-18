@@ -10,6 +10,42 @@ warnings.filterwarnings(
     message="torch.nn.utils.weight_norm is deprecated in favor of torch.nn.utils.parametrizations.weight_norm.",
 )
 
+# TTS-only cleanup for stray speaker labels at line starts.
+TTS_LINE_PREFIX_FILTERS = ["AI:", "Assistant:", "Bot:"]
+
+
+def strip_tts_line_prefixes(text: str, prefixes: list[str] | None = None) -> str:
+    """Strip configured speaker-label prefixes at the beginning of each line."""
+    if not text:
+        return text
+
+    active_prefixes = prefixes or TTS_LINE_PREFIX_FILTERS
+    sanitized_lines: list[str] = []
+
+    for line in text.split("\n"):
+        current = line
+
+        while True:
+            leading_ws_len = len(current) - len(current.lstrip())
+            indentation = current[:leading_ws_len]
+            body = current[leading_ws_len:]
+
+            stripped = False
+            for prefix in active_prefixes:
+                if body.startswith(prefix):
+                    body = body[len(prefix):]
+                    body = body.lstrip()
+                    current = indentation + body
+                    stripped = True
+                    break
+
+            if not stripped:
+                break
+
+        sanitized_lines.append(current)
+
+    return "\n".join(sanitized_lines)
+
 
 class TextToSpeechService:
     def __init__(self, device: str | None = None):
@@ -70,8 +106,9 @@ class TextToSpeechService:
         Returns:
             tuple: A tuple containing the sample rate and the generated audio array.
         """
+        sanitized_text = strip_tts_line_prefixes(text)
         wav = self.model.generate(
-            text,
+            sanitized_text,
             audio_prompt_path=audio_prompt_path,
             exaggeration=exaggeration,
             cfg_weight=cfg_weight
