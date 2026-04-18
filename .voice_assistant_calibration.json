@@ -1,0 +1,13 @@
+{
+  "energy_threshold": 0.01,
+  "frame_ms": 20,
+  "max_utterance_ms": 20000,
+  "noise_rms_mean": 0.0005172155989566818,
+  "noise_rms_std": 0.00014988558619916348,
+  "pre_roll_ms": 300,
+  "silence_ms": 2800,
+  "start_required": 2,
+  "start_window": 3,
+  "vad_aggressiveness": 2,
+  "version": 1
+}

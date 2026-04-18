@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random
 import threading
 import time
 from collections import deque
@@ -29,6 +30,7 @@ stt = whisper.load_model("base.en")
 
 SAMPLE_RATE = 16000
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".voice_assistant_calibration.json")
+SESSION_ID = "voice_assistant_session"
 
 
 # Parse command line arguments
@@ -46,6 +48,7 @@ parser.add_argument(
 )
 parser.add_argument("--api-key", type=str, default=None, help="API key for cloud LLM providers (or set MINIMAX_API_KEY env var)")
 parser.add_argument("--temperature", type=float, default=0.7, help="LLM temperature (default: 0.7)")
+parser.add_argument("--prompt-file", type=str, default="prompt.txt", help="Path to system prompt file (default: prompt.txt)")
 parser.add_argument("--save-voice", action="store_true", help="Save generated voice samples")
 parser.add_argument("--input-mode", type=str, default="auto", choices=["manual", "auto"], help="Microphone input mode")
 parser.add_argument("--vad-mode", type=str, default="hybrid", choices=["energy", "webrtc", "hybrid"], help="Voice activation mode")
@@ -59,6 +62,18 @@ parser.add_argument("--max-utterance-ms", type=int, default=20000, help="Maximum
 parser.add_argument("--pre-roll-ms", type=int, default=300, help="Audio kept before trigger start")
 parser.add_argument("--energy-threshold", type=float, default=None, help="Override calibrated energy threshold")
 parser.add_argument("--calibration-path", type=str, default=DEFAULT_CONFIG_PATH, help="Calibration settings file path")
+parser.add_argument(
+    "--idle-enabled",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Enable proactive assistant turns during prolonged user silence (auto mode only)",
+)
+parser.add_argument("--idle-start-seconds", type=float, default=3.0, help="Silence duration before first proactive check")
+parser.add_argument("--idle-check-seconds", type=float, default=1.0, help="Interval between proactive checks after idle start")
+parser.add_argument("--idle-initial-prob", type=float, default=0.35, help="Initial chance of proactive turn at first idle check")
+parser.add_argument("--idle-prob-step", type=float, default=0.10, help="Probability increase after each failed idle check")
+parser.add_argument("--idle-prob-max", type=float, default=0.80, help="Maximum proactive probability cap")
+parser.add_argument("--idle-max-words", type=int, default=20, help="Maximum words for proactive idle response")
 args = parser.parse_args()
 
 
@@ -103,9 +118,8 @@ def create_llm(provider: str, model: str | None = None, api_key: str | None = No
 
 
 # Modern prompt template using ChatPromptTemplate
-f = open("prompt.txt", "r")
-prompt_text = f.read()
-f.close()
+with open(args.prompt_file, "r", encoding="utf-8") as f:
+    prompt_text = f.read()
 
 prompt_template = ChatPromptTemplate.from_messages([
     ("system", prompt_text),
@@ -445,6 +459,83 @@ def capture_utterance_auto(config: dict[str, Any]) -> np.ndarray:
     return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+def capture_utterance_auto_with_timeout(
+    config: dict[str, Any],
+    listen_timeout_seconds: float | None = None,
+) -> np.ndarray:
+    """Capture one utterance in auto mode, returning empty audio if no speech starts within timeout."""
+    frame_ms = int(config["frame_ms"])
+    frame_samples = int(SAMPLE_RATE * frame_ms / 1000)
+    threshold = float(config["energy_threshold"])
+    start_window = int(config["start_window"])
+    start_required = int(config["start_required"])
+    silence_ms = int(config["silence_ms"])
+    max_utterance_ms = int(config["max_utterance_ms"])
+    pre_roll_frames = int(config["pre_roll_ms"] // frame_ms)
+
+    vad = build_vad(args.vad_mode, int(config["vad_aggressiveness"]))
+
+    trigger_window: deque[bool] = deque(maxlen=start_window)
+    pre_roll: deque[bytes] = deque(maxlen=max(1, pre_roll_frames) if pre_roll_frames > 0 else 1)
+    captured_frames: list[bytes] = []
+
+    recording = False
+    silence_frames = 0
+    total_frames = 0
+    start_wait = time.monotonic()
+
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        dtype="int16",
+        channels=1,
+        blocksize=frame_samples,
+    ) as stream:
+        while True:
+            frame_bytes, overflowed = stream.read(frame_samples)
+            if overflowed:
+                console.print("[yellow]Input overflow detected.[/yellow]")
+
+            frame = bytes(frame_bytes)
+            rms = frame_rms(frame)
+            is_active = frame_is_active(args.vad_mode, vad, frame, rms, threshold)
+
+            if not recording:
+                pre_roll.append(frame)
+                trigger_window.append(is_active)
+                if len(trigger_window) == start_window and should_start_from_history(list(trigger_window), start_required):
+                    recording = True
+                    captured_frames.extend(pre_roll)
+                    total_frames = len(captured_frames)
+                    silence_frames = 0
+                    console.print("[green]Speech detected. Recording...[/green]")
+                    continue
+
+                if listen_timeout_seconds is not None and listen_timeout_seconds >= 0.0:
+                    if time.monotonic() - start_wait >= listen_timeout_seconds:
+                        return np.array([], dtype=np.float32)
+                continue
+
+            captured_frames.append(frame)
+            total_frames += 1
+
+            if is_active:
+                silence_frames = 0
+            else:
+                silence_frames += 1
+
+            if should_stop_recording(
+                silence_frames=silence_frames,
+                total_frames=total_frames,
+                frame_ms=frame_ms,
+                silence_ms=silence_ms,
+                max_utterance_ms=max_utterance_ms,
+            ):
+                break
+
+    audio_data = b"".join(captured_frames)
+    return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
 def capture_utterance_manual() -> np.ndarray:
     """Capture one utterance with Enter-to-start/stop behavior."""
     console.input("🎤 Press Enter to start recording, then press Enter again to stop.")
@@ -490,18 +581,116 @@ def get_llm_response(text: str) -> str:
     Returns:
         str: The generated response.
     """
-    # Use a default session ID for this simple voice assistant
-    session_id = "voice_assistant_session"
-
     # Invoke the chain with history
     response = chain_with_history.invoke(
         {"input": text},
-        config={"session_id": session_id},
+        config={"session_id": SESSION_ID},
     )
 
     # The response is now a string from the LLM, no need to remove "Assistant:" prefix
     # since we're using a proper chat model setup
     return response.strip()
+
+
+def _message_to_text(content: Any) -> str:
+    """Normalize LangChain message content to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return " ".join(part.strip() for part in parts if part.strip())
+    return str(content)
+
+
+def trim_words(text: str, max_words: int) -> str:
+    """Trim text to a maximum number of words."""
+    if max_words <= 0:
+        return text.strip()
+    words = text.strip().split()
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words]).strip()
+
+
+def build_idle_prompt(session_id: str, max_words: int) -> str:
+    """Build a direct-model prompt for proactive idle check-ins."""
+    history = get_session_history(session_id)
+    recent_messages = history.messages[-12:]
+    transcript_lines: list[str] = []
+
+    for message in recent_messages:
+        role = "User" if message.type == "human" else "Assistant" if message.type == "ai" else message.type.title()
+        text = _message_to_text(message.content).strip()
+        if text:
+            transcript_lines.append(f"{role}: {text}")
+
+    transcript = "\n".join(transcript_lines) if transcript_lines else "(No prior conversation yet)"
+
+    return (
+        f"{prompt_text}\n\n"
+        "Conversation context:\n"
+        f"{transcript}\n\n"
+        "The user has been silent for a while. Generate the assistant's next natural message so it continues where you left off or adds to it.\n"
+        f"Requirements: one short sentence, at most {max_words} words, context-aware, no filler, no role labels."
+    )
+
+
+def get_idle_llm_response(session_id: str, max_words: int) -> str:
+    """Generate a proactive message without injecting a synthetic human turn."""
+    prompt = build_idle_prompt(session_id, max_words=max_words)
+    raw_response = llm.invoke(prompt)
+
+    if isinstance(raw_response, str):
+        text = raw_response.strip()
+    else:
+        text = _message_to_text(getattr(raw_response, "content", raw_response)).strip()
+
+    text = trim_words(text, max_words=max_words)
+    if not text:
+        text = "Need anything right now?"
+
+    get_session_history(session_id).add_ai_message(text)
+    return text
+
+
+def init_idle_state(start_seconds: float, initial_probability: float) -> dict[str, float]:
+    """Initialize idle check schedule and probability."""
+    return {
+        "next_check_elapsed_s": max(0.0, start_seconds),
+        "current_probability": max(0.0, min(1.0, initial_probability)),
+    }
+
+
+def should_run_idle_check(elapsed_s: float, next_check_elapsed_s: float) -> bool:
+    """Return True when elapsed idle time has reached the next check boundary."""
+    return elapsed_s >= next_check_elapsed_s
+
+
+def register_idle_miss(
+    idle_state: dict[str, float],
+    check_seconds: float,
+    probability_step: float,
+    probability_max: float,
+) -> None:
+    """Advance idle schedule/probability after a failed random check."""
+    idle_state["next_check_elapsed_s"] += max(0.1, check_seconds)
+    idle_state["current_probability"] = min(
+        max(0.0, min(1.0, probability_max)),
+        idle_state["current_probability"] + max(0.0, probability_step),
+    )
+
+
+def reset_idle_state(idle_state: dict[str, float], start_seconds: float, initial_probability: float) -> None:
+    """Reset idle schedule/probability to baseline."""
+    idle_state["next_check_elapsed_s"] = max(0.0, start_seconds)
+    idle_state["current_probability"] = max(0.0, min(1.0, initial_probability))
 
 
 def play_audio(sample_rate: int, audio_array: np.ndarray) -> None:
@@ -593,13 +782,41 @@ if __name__ == "__main__":
         )
 
     response_count = 0
+    idle_start_seconds = max(0.0, float(args.idle_start_seconds))
+    idle_check_seconds = max(0.1, float(args.idle_check_seconds))
+    idle_initial_prob = max(0.0, min(1.0, float(args.idle_initial_prob)))
+    idle_prob_step = max(0.0, float(args.idle_prob_step))
+    idle_prob_max = max(0.0, min(1.0, float(args.idle_prob_max)))
+    idle_max_words = max(1, int(args.idle_max_words))
+    idle_enabled = bool(args.idle_enabled) and args.input_mode == "auto"
+    last_activity_at = time.monotonic()
+    idle_state = init_idle_state(idle_start_seconds, idle_initial_prob)
+
+    if idle_enabled:
+        console.print(
+            "[dim]Idle checks start={}s, cadence={}s, prob={:.0f}% +{:.0f}% (cap {:.0f}%), max words={}[/dim]".format(
+                idle_start_seconds,
+                idle_check_seconds,
+                idle_initial_prob * 100,
+                idle_prob_step * 100,
+                idle_prob_max * 100,
+                idle_max_words,
+            )
+        )
 
     try:
         while True:
             if args.input_mode == "manual":
                 audio_np = capture_utterance_manual()
             else:
-                audio_np = capture_utterance_auto(activation_config)
+                listen_timeout_seconds = None
+                if idle_enabled:
+                    elapsed = time.monotonic() - last_activity_at
+                    listen_timeout_seconds = max(0.1, idle_state["next_check_elapsed_s"] - elapsed)
+                audio_np = capture_utterance_auto_with_timeout(
+                    activation_config,
+                    listen_timeout_seconds=listen_timeout_seconds,
+                )
 
             if audio_np.size > 0:
                 with console.status("Transcribing...", spinner="dots"):
@@ -609,6 +826,8 @@ if __name__ == "__main__":
                     continue
 
                 console.print(f"[yellow]You: {text}")
+                last_activity_at = time.monotonic()
+                reset_idle_state(idle_state, idle_start_seconds, idle_initial_prob)
 
                 with console.status("Generating response...", spinner="dots"):
                     response = get_llm_response(text)
@@ -637,8 +856,59 @@ if __name__ == "__main__":
                     console.print(f"[dim]Voice saved to: {filename}[/dim]")
 
                 play_audio(sample_rate, audio_array)
+                last_activity_at = time.monotonic()
+                reset_idle_state(idle_state, idle_start_seconds, idle_initial_prob)
             else:
-                console.print("[red]No audio recorded. Please ensure your microphone is working.[/red]")
+                if not idle_enabled:
+                    console.print("[red]No audio recorded. Please ensure your microphone is working.[/red]")
+                    continue
+
+                elapsed = time.monotonic() - last_activity_at
+                if not should_run_idle_check(elapsed, idle_state["next_check_elapsed_s"]):
+                    continue
+
+                chance = idle_state["current_probability"]
+                roll = random.random()
+                if roll >= chance:
+                    register_idle_miss(idle_state, idle_check_seconds, idle_prob_step, idle_prob_max)
+                    console.print(
+                        "[dim]Idle check skipped ({:.0f}% chance, roll {:.2f}). Next check at {:.1f}s.[/dim]".format(
+                            chance * 100,
+                            roll,
+                            idle_state["next_check_elapsed_s"],
+                        )
+                    )
+                    continue
+
+                with console.status("Generating proactive response...", spinner="dots"):
+                    response = get_idle_llm_response(SESSION_ID, max_words=idle_max_words)
+                    dynamic_exaggeration = analyze_emotion(response)
+                    dynamic_cfg = args.cfg_weight * 0.8 if dynamic_exaggeration > 0.6 else args.cfg_weight
+                    sample_rate, audio_array = tts.long_form_synthesize(
+                        response,
+                        audio_prompt_path=args.voice,
+                        exaggeration=dynamic_exaggeration,
+                        cfg_weight=dynamic_cfg,
+                    )
+
+                console.print(f"[cyan]Assistant: {response}")
+                console.print(
+                    "[dim](Proactive idle turn | chance: {:.0f}%, Emotion: {:.2f}, CFG: {:.2f})[/dim]".format(
+                        chance * 100,
+                        dynamic_exaggeration,
+                        dynamic_cfg,
+                    )
+                )
+
+                if args.save_voice:
+                    response_count += 1
+                    filename = f"voices/response_{response_count:03d}.wav"
+                    tts.save_voice_sample(response, filename, args.voice)
+                    console.print(f"[dim]Voice saved to: {filename}[/dim]")
+
+                play_audio(sample_rate, audio_array)
+                last_activity_at = time.monotonic()
+                reset_idle_state(idle_state, idle_start_seconds, idle_initial_prob)
 
     except KeyboardInterrupt:
         console.print("\n[red]Exiting...[/red]")
