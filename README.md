@@ -180,6 +180,13 @@ python app.py --provider minimax --voice path/to/voice.wav --exaggeration 0.7
   - Higher values: Slower, more deliberate speech
 - `--model`: Ollama model to use (default: llama2)
 - `--save-voice`: Save generated audio responses to `voices/` directory
+- `--idle-enabled` / `--no-idle-enabled`: Enable/disable proactive assistant turns during user silence (auto mode only, default: enabled)
+- `--idle-start-seconds`: Silence before first proactive check (default: 20)
+- `--idle-check-seconds`: Check cadence after idle start (default: 5)
+- `--idle-initial-prob`: Initial proactive probability at first check (default: 0.35)
+- `--idle-prob-step`: Probability increase after each skipped check (default: 0.10)
+- `--idle-prob-max`: Maximum proactive probability cap (default: 0.80)
+- `--idle-max-words`: Word limit for proactive replies (default: 20)
 
 ### Implementation Details
 

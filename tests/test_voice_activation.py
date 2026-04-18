@@ -140,5 +140,79 @@ class TestCalibrationConfig(unittest.TestCase):
         self.assertEqual(loaded, {})
 
 
+class TestIdleInitiationHelpers(unittest.TestCase):
+    """Tests for proactive idle initiation helpers."""
+
+    def _import_helpers(self):
+        mock_nltk = MagicMock()
+        mock_nltk.__spec__ = MagicMock()
+
+        mock_modules = {
+            "whisper": MagicMock(),
+            "sounddevice": MagicMock(),
+            "torch": MagicMock(),
+            "torchaudio": MagicMock(),
+            "nltk": mock_nltk,
+            "chatterbox": MagicMock(),
+            "chatterbox.tts": MagicMock(),
+            "tts": MagicMock(),
+        }
+
+        with patch.dict("sys.modules", mock_modules):
+            with patch("sys.argv", ["app.py"]):
+                if "app" in sys.modules:
+                    del sys.modules["app"]
+                import app
+
+        return app
+
+    def test_idle_probability_progression_and_cap(self):
+        app = self._import_helpers()
+        idle_state = app.init_idle_state(20.0, 0.35)
+
+        app.register_idle_miss(idle_state, 5.0, 0.10, 0.80)
+        self.assertAlmostEqual(idle_state["next_check_elapsed_s"], 25.0)
+        self.assertAlmostEqual(idle_state["current_probability"], 0.45)
+
+        for _ in range(10):
+            app.register_idle_miss(idle_state, 5.0, 0.10, 0.80)
+
+        self.assertAlmostEqual(idle_state["current_probability"], 0.80)
+
+    def test_idle_check_cadence_gating(self):
+        app = self._import_helpers()
+        self.assertFalse(app.should_run_idle_check(19.9, 20.0))
+        self.assertTrue(app.should_run_idle_check(20.0, 20.0))
+        self.assertFalse(app.should_run_idle_check(24.9, 25.0))
+        self.assertTrue(app.should_run_idle_check(25.0, 25.0))
+
+    def test_reset_idle_state(self):
+        app = self._import_helpers()
+        idle_state = app.init_idle_state(20.0, 0.35)
+        app.register_idle_miss(idle_state, 5.0, 0.10, 0.80)
+
+        app.reset_idle_state(idle_state, 20.0, 0.35)
+        self.assertAlmostEqual(idle_state["next_check_elapsed_s"], 20.0)
+        self.assertAlmostEqual(idle_state["current_probability"], 0.35)
+
+    def test_trim_words_applies_limit(self):
+        app = self._import_helpers()
+        text = "one two three four five"
+        self.assertEqual(app.trim_words(text, 3), "one two three")
+        self.assertEqual(app.trim_words(text, 10), text)
+
+    def test_build_idle_prompt_uses_history_context(self):
+        app = self._import_helpers()
+        session = app.get_session_history("test_idle")
+        session.add_user_message("Can you remind me about my workout?")
+        session.add_ai_message("Sure, your workout is at 6 PM.")
+
+        prompt = app.build_idle_prompt("test_idle", max_words=20)
+        self.assertIn("Conversation context:", prompt)
+        self.assertIn("User: Can you remind me about my workout?", prompt)
+        self.assertIn("Assistant: Sure, your workout is at 6 PM.", prompt)
+        self.assertIn("at most 20 words", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
