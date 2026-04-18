@@ -16,6 +16,7 @@ dependencies = [
     "setuptools>=80.9.0",
     "sounddevice>=0.5.2",
     "torchaudio>=2.6.0",
+    "webrtcvad>=2.0.10",
 ]
 
 [dependency-groups]

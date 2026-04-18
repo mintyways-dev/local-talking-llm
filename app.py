@@ -1,22 +1,35 @@
-import time
-import threading
-import numpy as np
-import whisper
-import sounddevice as sd
 import argparse
+import json
 import os
+import threading
+import time
+from collections import deque
 from queue import Queue
-from rich.console import Console
-# Updated imports for modern LangChain
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from typing import Any
+
+import numpy as np
+import sounddevice as sd
+import whisper
 from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_ollama import OllamaLLM
+from rich.console import Console
+
 from tts import TextToSpeechService
+
+try:
+    import webrtcvad
+except ImportError:
+    webrtcvad = None
 
 console = Console()
 stt = whisper.load_model("base.en")
+
+SAMPLE_RATE = 16000
+DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".voice_assistant_calibration.json")
+
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description="Local Voice Assistant with ChatterBox TTS")
@@ -24,12 +37,30 @@ parser.add_argument("--voice", type=str, help="Path to voice sample for cloning"
 parser.add_argument("--exaggeration", type=float, default=0.5, help="Emotion exaggeration (0.0-1.0)")
 parser.add_argument("--cfg-weight", type=float, default=0.5, help="CFG weight for pacing (0.0-1.0)")
 parser.add_argument("--model", type=str, default=None, help="LLM model name (default: gemma3 for ollama, MiniMax-M2.7 for minimax)")
-parser.add_argument("--provider", type=str, default="ollama", choices=["ollama", "minimax"],
-                    help="LLM provider: 'ollama' for local models, 'minimax' for MiniMax cloud API (default: ollama)")
+parser.add_argument(
+    "--provider",
+    type=str,
+    default="ollama",
+    choices=["ollama", "minimax"],
+    help="LLM provider: 'ollama' for local models, 'minimax' for MiniMax cloud API (default: ollama)",
+)
 parser.add_argument("--api-key", type=str, default=None, help="API key for cloud LLM providers (or set MINIMAX_API_KEY env var)")
 parser.add_argument("--temperature", type=float, default=0.7, help="LLM temperature (default: 0.7)")
 parser.add_argument("--save-voice", action="store_true", help="Save generated voice samples")
+parser.add_argument("--input-mode", type=str, default="auto", choices=["manual", "auto"], help="Microphone input mode")
+parser.add_argument("--vad-mode", type=str, default="hybrid", choices=["energy", "webrtc", "hybrid"], help="Voice activation mode")
+parser.add_argument("--calibrate", action="store_true", help="Run microphone calibration and exit")
+parser.add_argument("--vad-aggressiveness", type=int, default=2, choices=[0, 1, 2, 3], help="WebRTC VAD aggressiveness")
+parser.add_argument("--frame-ms", type=int, default=20, choices=[10, 20, 30], help="Frame size in ms for voice activation")
+parser.add_argument("--start-window", type=int, default=3, help="Sliding window size for start trigger")
+parser.add_argument("--start-required", type=int, default=2, help="Required active frames in start window")
+parser.add_argument("--silence-ms", type=int, default=800, help="Silence duration to end an utterance")
+parser.add_argument("--max-utterance-ms", type=int, default=20000, help="Maximum utterance length")
+parser.add_argument("--pre-roll-ms", type=int, default=300, help="Audio kept before trigger start")
+parser.add_argument("--energy-threshold", type=float, default=None, help="Override calibrated energy threshold")
+parser.add_argument("--calibration-path", type=str, default=DEFAULT_CONFIG_PATH, help="Calibration settings file path")
 args = parser.parse_args()
+
 
 # Initialize TTS with ChatterBox
 tts = TextToSpeechService()
@@ -75,7 +106,7 @@ def create_llm(provider: str, model: str | None = None, api_key: str | None = No
 prompt_template = ChatPromptTemplate.from_messages([
     ("system", "You are a helpful and friendly AI assistant. You are polite, respectful, and aim to provide concise responses of less than 20 words."),
     MessagesPlaceholder(variable_name="history"),
-    ("human", "{input}")
+    ("human", "{input}"),
 ])
 
 # Initialize LLM via provider factory
@@ -91,13 +122,15 @@ llm = create_llm(
 chain = prompt_template | llm | StrOutputParser()
 
 # Chat history storage
-chat_sessions = {}
+chat_sessions: dict[str, InMemoryChatMessageHistory] = {}
+
 
 def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
     """Get or create chat history for a session."""
     if session_id not in chat_sessions:
         chat_sessions[session_id] = InMemoryChatMessageHistory()
     return chat_sessions[session_id]
+
 
 # Create the runnable with message history
 chain_with_history = RunnableWithMessageHistory(
@@ -107,27 +140,325 @@ chain_with_history = RunnableWithMessageHistory(
     history_messages_key="history",
 )
 
-def record_audio(stop_event, data_queue):
+
+def record_audio(stop_event: threading.Event, data_queue: Queue[bytes]) -> None:
     """
     Captures audio data from the user's microphone and adds it to a queue for further processing.
-
-    Args:
-        stop_event (threading.Event): An event that, when set, signals the function to stop recording.
-        data_queue (queue.Queue): A queue to which the recorded audio data will be added.
-
-    Returns:
-        None
     """
-    def callback(indata, frames, time, status):
+
+    def callback(indata, frames, callback_time, status):  # type: ignore[no-untyped-def]
         if status:
             console.print(status)
         data_queue.put(bytes(indata))
 
     with sd.RawInputStream(
-        samplerate=16000, dtype="int16", channels=1, callback=callback
+        samplerate=SAMPLE_RATE,
+        dtype="int16",
+        channels=1,
+        callback=callback,
     ):
         while not stop_event.is_set():
             time.sleep(0.1)
+
+
+def frame_rms(frame_bytes: bytes) -> float:
+    """Compute normalized RMS for a PCM16 mono audio frame."""
+    samples = np.frombuffer(frame_bytes, dtype=np.int16)
+    if samples.size == 0:
+        return 0.0
+    float_samples = samples.astype(np.float32) / 32768.0
+    return float(np.sqrt(np.mean(float_samples * float_samples)))
+
+
+def derive_energy_threshold(
+    noise_levels: list[float],
+    sigma_multiplier: float = 3.0,
+    min_threshold: float = 0.01,
+) -> dict[str, float]:
+    """Derive an activation threshold from ambient-noise RMS samples."""
+    if not noise_levels:
+        return {"noise_rms_mean": 0.0, "noise_rms_std": 0.0, "energy_threshold": min_threshold}
+
+    noise_mean = float(np.mean(noise_levels))
+    noise_std = float(np.std(noise_levels))
+    threshold = max(min_threshold, noise_mean + sigma_multiplier * noise_std)
+    return {
+        "noise_rms_mean": noise_mean,
+        "noise_rms_std": noise_std,
+        "energy_threshold": threshold,
+    }
+
+
+def should_start_from_history(recent_active_flags: list[bool], required_active: int) -> bool:
+    """Return True when active frames in a sliding window pass trigger requirement."""
+    return sum(1 for flag in recent_active_flags if flag) >= required_active
+
+
+def should_stop_recording(
+    silence_frames: int,
+    total_frames: int,
+    frame_ms: int,
+    silence_ms: int,
+    max_utterance_ms: int,
+) -> bool:
+    """Return True when utterance should end on silence or max duration."""
+    return silence_frames * frame_ms >= silence_ms or total_frames * frame_ms >= max_utterance_ms
+
+
+def load_calibration(path: str) -> dict[str, Any]:
+    """Load saved calibration settings from disk."""
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_calibration(path: str, config: dict[str, Any]) -> None:
+    """Persist calibration settings to disk."""
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+
+
+def build_vad(vad_mode: str, aggressiveness: int):
+    """Create WebRTC VAD instance for webrtc/hybrid modes."""
+    if vad_mode in {"webrtc", "hybrid"}:
+        if webrtcvad is None:
+            raise RuntimeError("webrtcvad is required for webrtc/hybrid modes. Install dependency `webrtcvad`.")
+        return webrtcvad.Vad(aggressiveness)
+    return None
+
+
+def frame_is_active(vad_mode: str, vad, frame_bytes: bytes, rms: float, threshold: float) -> bool:
+    """Evaluate whether a frame should count as active speech."""
+    energy_active = rms >= threshold
+    if vad_mode == "energy":
+        return energy_active
+
+    is_voiced = bool(vad and vad.is_speech(frame_bytes, SAMPLE_RATE))
+    if vad_mode == "webrtc":
+        return is_voiced
+    return energy_active and is_voiced
+
+
+def collect_noise_levels(frame_ms: int, duration_sec: float = 3.0) -> list[float]:
+    """Capture ambient RMS samples for calibration."""
+    frame_samples = int(SAMPLE_RATE * frame_ms / 1000)
+    frame_count = max(1, int((duration_sec * 1000) // frame_ms))
+    levels: list[float] = []
+
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        dtype="int16",
+        channels=1,
+        blocksize=frame_samples,
+    ) as stream:
+        for _ in range(frame_count):
+            frame_bytes, overflowed = stream.read(frame_samples)
+            if overflowed:
+                console.print("[yellow]Input overflow detected during calibration.[/yellow]")
+            levels.append(frame_rms(bytes(frame_bytes)))
+
+    return levels
+
+
+def validate_calibration(threshold: float, vad_mode: str, vad_aggressiveness: int, frame_ms: int) -> bool:
+    """Run a short interactive validation meter for calibration."""
+    frame_samples = int(SAMPLE_RATE * frame_ms / 1000)
+    frame_count = max(1, int(5000 // frame_ms))
+    vad = build_vad(vad_mode, vad_aggressiveness)
+
+    console.print("[cyan]Validation: speak for 5 seconds to test activation.[/cyan]")
+
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        dtype="int16",
+        channels=1,
+        blocksize=frame_samples,
+    ) as stream:
+        for idx in range(frame_count):
+            frame_bytes, overflowed = stream.read(frame_samples)
+            if overflowed:
+                console.print("[yellow]Input overflow detected during validation.[/yellow]")
+            frame = bytes(frame_bytes)
+            rms = frame_rms(frame)
+            active = frame_is_active(vad_mode, vad, frame, rms, threshold)
+            if idx % max(1, int(1000 // frame_ms)) == 0:
+                status = "TRIGGER" if active else "idle"
+                console.print(f"[dim]RMS={rms:.4f} threshold={threshold:.4f} [{status}][/dim]")
+
+    confirm = console.input("Accept this calibration? [Y/n/r=retry]: ").strip().lower()
+    return confirm not in {"n", "r", "retry"}
+
+
+def run_calibration(calibration_path: str) -> dict[str, Any]:
+    """Perform calibration and persist settings."""
+    while True:
+        console.print("[cyan]Calibration: stay quiet for 3 seconds...[/cyan]")
+        noise_levels = collect_noise_levels(args.frame_ms, duration_sec=3.0)
+        metrics = derive_energy_threshold(noise_levels)
+
+        console.print(
+            "[green]Noise mean={:.4f}, std={:.4f}, threshold={:.4f}[/green]".format(
+                metrics["noise_rms_mean"],
+                metrics["noise_rms_std"],
+                metrics["energy_threshold"],
+            )
+        )
+
+        accepted = validate_calibration(
+            threshold=metrics["energy_threshold"],
+            vad_mode=args.vad_mode,
+            vad_aggressiveness=args.vad_aggressiveness,
+            frame_ms=args.frame_ms,
+        )
+        if accepted:
+            config: dict[str, Any] = {
+                "version": 1,
+                "energy_threshold": metrics["energy_threshold"],
+                "noise_rms_mean": metrics["noise_rms_mean"],
+                "noise_rms_std": metrics["noise_rms_std"],
+                "vad_aggressiveness": args.vad_aggressiveness,
+                "frame_ms": args.frame_ms,
+                "silence_ms": args.silence_ms,
+                "start_window": args.start_window,
+                "start_required": args.start_required,
+                "pre_roll_ms": args.pre_roll_ms,
+                "max_utterance_ms": args.max_utterance_ms,
+            }
+            save_calibration(calibration_path, config)
+            console.print(f"[green]Calibration saved to: {calibration_path}[/green]")
+            return config
+
+        console.print("[yellow]Retrying calibration...[/yellow]")
+
+
+def get_activation_config() -> dict[str, Any]:
+    """Resolve runtime activation config from defaults, file, and CLI overrides."""
+    config = load_calibration(args.calibration_path)
+
+    resolved = {
+        "energy_threshold": float(config.get("energy_threshold", 0.02)),
+        "vad_aggressiveness": int(config.get("vad_aggressiveness", args.vad_aggressiveness)),
+        "frame_ms": int(config.get("frame_ms", args.frame_ms)),
+        "silence_ms": int(config.get("silence_ms", args.silence_ms)),
+        "start_window": int(config.get("start_window", args.start_window)),
+        "start_required": int(config.get("start_required", args.start_required)),
+        "pre_roll_ms": int(config.get("pre_roll_ms", args.pre_roll_ms)),
+        "max_utterance_ms": int(config.get("max_utterance_ms", args.max_utterance_ms)),
+    }
+
+    if args.energy_threshold is not None:
+        resolved["energy_threshold"] = float(args.energy_threshold)
+
+    # CLI should always override persisted values for these options.
+    resolved["vad_aggressiveness"] = args.vad_aggressiveness
+    resolved["frame_ms"] = args.frame_ms
+    resolved["silence_ms"] = args.silence_ms
+    resolved["start_window"] = args.start_window
+    resolved["start_required"] = args.start_required
+    resolved["pre_roll_ms"] = args.pre_roll_ms
+    resolved["max_utterance_ms"] = args.max_utterance_ms
+
+    resolved["start_window"] = max(1, resolved["start_window"])
+    resolved["start_required"] = max(1, min(resolved["start_window"], resolved["start_required"]))
+    resolved["pre_roll_ms"] = max(0, resolved["pre_roll_ms"])
+
+    return resolved
+
+
+def capture_utterance_auto(config: dict[str, Any]) -> np.ndarray:
+    """Capture one utterance using voice activation."""
+    frame_ms = int(config["frame_ms"])
+    frame_samples = int(SAMPLE_RATE * frame_ms / 1000)
+    threshold = float(config["energy_threshold"])
+    start_window = int(config["start_window"])
+    start_required = int(config["start_required"])
+    silence_ms = int(config["silence_ms"])
+    max_utterance_ms = int(config["max_utterance_ms"])
+    pre_roll_frames = int(config["pre_roll_ms"] // frame_ms)
+
+    vad = build_vad(args.vad_mode, int(config["vad_aggressiveness"]))
+
+    trigger_window: deque[bool] = deque(maxlen=start_window)
+    pre_roll: deque[bytes] = deque(maxlen=max(1, pre_roll_frames) if pre_roll_frames > 0 else 1)
+    captured_frames: list[bytes] = []
+
+    recording = False
+    silence_frames = 0
+    total_frames = 0
+
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        dtype="int16",
+        channels=1,
+        blocksize=frame_samples,
+    ) as stream:
+        console.print("[cyan]Listening for speech...[/cyan]")
+
+        while True:
+            frame_bytes, overflowed = stream.read(frame_samples)
+            if overflowed:
+                console.print("[yellow]Input overflow detected.[/yellow]")
+
+            frame = bytes(frame_bytes)
+            rms = frame_rms(frame)
+            is_active = frame_is_active(args.vad_mode, vad, frame, rms, threshold)
+
+            if not recording:
+                pre_roll.append(frame)
+                trigger_window.append(is_active)
+                if len(trigger_window) == start_window and should_start_from_history(list(trigger_window), start_required):
+                    recording = True
+                    captured_frames.extend(pre_roll)
+                    total_frames = len(captured_frames)
+                    silence_frames = 0
+                    console.print("[green]Speech detected. Recording...[/green]")
+                continue
+
+            captured_frames.append(frame)
+            total_frames += 1
+
+            if is_active:
+                silence_frames = 0
+            else:
+                silence_frames += 1
+
+            if should_stop_recording(
+                silence_frames=silence_frames,
+                total_frames=total_frames,
+                frame_ms=frame_ms,
+                silence_ms=silence_ms,
+                max_utterance_ms=max_utterance_ms,
+            ):
+                break
+
+    audio_data = b"".join(captured_frames)
+    return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def capture_utterance_manual() -> np.ndarray:
+    """Capture one utterance with Enter-to-start/stop behavior."""
+    console.input("🎤 Press Enter to start recording, then press Enter again to stop.")
+
+    data_queue: Queue[bytes] = Queue()
+    stop_event = threading.Event()
+    recording_thread = threading.Thread(
+        target=record_audio,
+        args=(stop_event, data_queue),
+    )
+    recording_thread.start()
+
+    input()
+    stop_event.set()
+    recording_thread.join()
+
+    audio_data = b"".join(list(data_queue.queue))
+    return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def transcribe(audio_np: np.ndarray) -> str:
@@ -161,7 +492,7 @@ def get_llm_response(text: str) -> str:
     # Invoke the chain with history
     response = chain_with_history.invoke(
         {"input": text},
-        config={"session_id": session_id}
+        config={"session_id": session_id},
     )
 
     # The response is now a string from the LLM, no need to remove "Assistant:" prefix
@@ -169,7 +500,7 @@ def get_llm_response(text: str) -> str:
     return response.strip()
 
 
-def play_audio(sample_rate, audio_array):
+def play_audio(sample_rate: int, audio_array: np.ndarray) -> None:
     """
     Plays the given audio data using the sounddevice library.
 
@@ -190,7 +521,21 @@ def analyze_emotion(text: str) -> float:
     Returns a value between 0.3 and 0.9 based on text content.
     """
     # Keywords that suggest more emotion
-    emotional_keywords = ['amazing', 'terrible', 'love', 'hate', 'excited', 'sad', 'happy', 'angry', 'wonderful', 'awful', '!', '?!', '...']
+    emotional_keywords = [
+        "amazing",
+        "terrible",
+        "love",
+        "hate",
+        "excited",
+        "sad",
+        "happy",
+        "angry",
+        "wonderful",
+        "awful",
+        "!",
+        "?!",
+        "...",
+    ]
 
     emotion_score = 0.5  # Default neutral
 
@@ -216,6 +561,9 @@ if __name__ == "__main__":
     console.print(f"[blue]CFG weight: {args.cfg_weight}")
     console.print(f"[blue]LLM model: {args.model or ('gemma3' if args.provider == 'ollama' else 'MiniMax-M2.7')}")
     console.print(f"[blue]LLM provider: {args.provider}")
+    console.print(f"[blue]Input mode: {args.input_mode}")
+    if args.input_mode == "auto":
+        console.print(f"[blue]Activation mode: {args.vad_mode}")
     console.print("[cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     console.print("[cyan]Press Ctrl+C to exit.\n")
 
@@ -223,34 +571,39 @@ if __name__ == "__main__":
     if args.save_voice:
         os.makedirs("voices", exist_ok=True)
 
+    if args.calibrate:
+        run_calibration(args.calibration_path)
+        raise SystemExit(0)
+
+    activation_config = get_activation_config()
+
+    if args.input_mode == "auto":
+        console.print(
+            "[dim]Activation threshold={:.4f}, start={}/{}, silence={}ms, max={}ms[/dim]".format(
+                activation_config["energy_threshold"],
+                activation_config["start_required"],
+                activation_config["start_window"],
+                activation_config["silence_ms"],
+                activation_config["max_utterance_ms"],
+            )
+        )
+
     response_count = 0
 
     try:
         while True:
-            console.input(
-                "🎤 Press Enter to start recording, then press Enter again to stop."
-            )
-
-            data_queue = Queue()  # type: ignore[var-annotated]
-            stop_event = threading.Event()
-            recording_thread = threading.Thread(
-                target=record_audio,
-                args=(stop_event, data_queue),
-            )
-            recording_thread.start()
-
-            input()
-            stop_event.set()
-            recording_thread.join()
-
-            audio_data = b"".join(list(data_queue.queue))
-            audio_np = (
-                np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-            )
+            if args.input_mode == "manual":
+                audio_np = capture_utterance_manual()
+            else:
+                audio_np = capture_utterance_auto(activation_config)
 
             if audio_np.size > 0:
                 with console.status("Transcribing...", spinner="dots"):
                     text = transcribe(audio_np)
+                if not text:
+                    console.print("[yellow]No speech detected in captured audio.[/yellow]")
+                    continue
+
                 console.print(f"[yellow]You: {text}")
 
                 with console.status("Generating response...", spinner="dots"):
@@ -266,7 +619,7 @@ if __name__ == "__main__":
                         response,
                         audio_prompt_path=args.voice,
                         exaggeration=dynamic_exaggeration,
-                        cfg_weight=dynamic_cfg
+                        cfg_weight=dynamic_cfg,
                     )
 
                 console.print(f"[cyan]Assistant: {response}")
@@ -281,11 +634,9 @@ if __name__ == "__main__":
 
                 play_audio(sample_rate, audio_array)
             else:
-                console.print(
-                    "[red]No audio recorded. Please ensure your microphone is working."
-                )
+                console.print("[red]No audio recorded. Please ensure your microphone is working.[/red]")
 
     except KeyboardInterrupt:
-        console.print("\n[red]Exiting...")
+        console.print("\n[red]Exiting...[/red]")
 
-    console.print("[blue]Session ended. Thank you for using ChatterBox Voice Assistant!")
+    console.print("[blue]Session ended. Thank you for using ChatterBox Voice Assistant![/blue]")
